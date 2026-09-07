@@ -8,7 +8,7 @@ var cors = require('cors');
 
 var app = express();
 var port = process.env.PORT || 7000;
-var baseDir ='http://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl';
+var baseDir ='https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl';
 
 // cors config
 var whitelist = [
@@ -165,6 +165,9 @@ function getGribData(targetMoment){
 				toplat: 90,
 				bottomlat: -90,
 				dir: '/gfs.'+stamp
+			},
+			headers: {
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 			}
 
 		}).on('error', function(err){

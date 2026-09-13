@@ -10,19 +10,14 @@ var app = express();
 var port = process.env.PORT || 7000;
 var baseDir ='https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl';
 
-// cors config
-var whitelist = [
-	'http://localhost:63342',
-	'http://localhost:3000',
-	'http://localhost:4000',
-	'http://danwild.github.io'
-];
+
+var REQUEST_DELAY_MS = 2500;   
+var HISTORY_HOURS = 24;        
+var GFS_PUBLISH_DELAY_HOURS = 4;
+var isHarvesting = false;      
 
 var corsOptions = {
-	origin: function(origin, callback){
-		var originIsWhitelisted = whitelist.indexOf(origin) !== -1;
-		callback(null, originIsWhitelisted);
-	}
+	origin: true
 };
 
 app.listen(port, function(err){
@@ -39,11 +34,7 @@ app.get('/alive', cors(corsOptions), function(req, res){
 
 app.get('/latest', cors(corsOptions), function(req, res){
 
-	/**
-	 * Find and return the latest available 6 hourly pre-parsed JSON data
-	 *
-	 * @param targetMoment {Object} UTC moment
-	 */
+	
 	function sendLatest(targetMoment){
 
 		var stamp = moment(targetMoment).format('YYYYMMDD') + roundHours(moment(targetMoment).hour(), 6);
@@ -68,12 +59,7 @@ app.get('/nearest', cors(corsOptions), function(req, res, next){
 	var limit = req.query.searchLimit;
 	var searchForwards = false;
 
-	/**
-	 * Find and return the nearest available 6 hourly pre-parsed JSON data
-	 * If limit provided, searches backwards to limit, then forwards to limit before failing.
-	 *
-	 * @param targetMoment {Object} UTC moment
-	 */
+
 	function sendNearestTo(targetMoment){
 
 		if( limit && Math.abs( moment.utc(time).diff(targetMoment, 'days'))  >= limit) {
@@ -108,49 +94,75 @@ app.get('/nearest', cors(corsOptions), function(req, res, next){
 
 });
 
-/**
- *
- * Ping for new data every 15 mins
- *
- */
+
 setInterval(function(){
 
-	run(moment.utc());
+	run(moment.utc().subtract(GFS_PUBLISH_DELAY_HOURS, 'hours'));
 
 }, 900000);
 
-/**
- *
- * @param targetMoment {Object} moment to check for new data
- */
+
 function run(targetMoment){
+
+	
+	if(isHarvesting){
+		console.log('ya hay una busqueda en curso, se omite esta corrida');
+		return;
+	}
+	isHarvesting = true;
 
 	getGribData(targetMoment).then(function(response){
 		if(response.stamp){
 			convertGribToJson(response.stamp, response.targetMoment);
 		}
+		else {
+			isHarvesting = false;
+		}
+	}).catch(function(){
+		isHarvesting = false;
 	});
 }
 
-/**
- *
- * Finds and returns the latest 6 hourly GRIB2 data from NOAAA
- *
- * @returns {*|promise}
- */
+
+function cleanupOldFiles(){
+	var dir = __dirname + '/json-data';
+	if(!checkPath(dir, false)) return;
+
+	var cutoff = moment.utc().subtract(HISTORY_HOURS + 12, 'hours');
+
+	fs.readdir(dir, function(err, files){
+		if(err) return;
+		files.forEach(function(file){
+			var match = file.match(/^(\d{8})(\d{2})\.json$/);
+			if(!match) return;
+			var fileMoment = moment.utc(match[1] + match[2], 'YYYYMMDDHH');
+			if(fileMoment.isValid() && fileMoment.isBefore(cutoff)){
+				fs.unlink(dir + '/' + file, function(){
+					console.log('borrado json viejo: ' + file);
+				});
+			}
+		});
+	});
+}
+
+
 function getGribData(targetMoment){
 
 	var deferred = Q.defer();
 
 	function runQuery(targetMoment){
 
-        // only go 2 weeks deep
-		if (moment.utc().diff(targetMoment, 'days') > 30){
+        
+		if (moment.utc().diff(targetMoment, 'days') > 3){
 	        console.log('hit limit, harvest complete or there is a big gap in data..');
+	        
+	        deferred.resolve({stamp: false, targetMoment: false});
             return;
         }
 
 		var stamp = moment(targetMoment).format('YYYYMMDD') + roundHours(moment(targetMoment).hour(), 6);
+		var dateFolder = moment(targetMoment).format('YYYYMMDD');
+		var hourFolder = roundHours(moment(targetMoment).hour(), 6);
 		request.get({
 			url: baseDir,
 			qs: {
@@ -164,34 +176,34 @@ function getGribData(targetMoment){
 				rightlon: 360,
 				toplat: 90,
 				bottomlat: -90,
-				dir: '/gfs.'+stamp
+				dir: '/gfs.'+dateFolder+'/'+hourFolder+'/atmos'
 			},
 			headers: {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 			}
 
 		}).on('error', function(err){
-			// console.log(err);
-			runQuery(moment(targetMoment).subtract(6, 'hours'));
+		
+			setTimeout(function(){ runQuery(moment(targetMoment).subtract(6, 'hours')); }, REQUEST_DELAY_MS);
 
 		}).on('response', function(response) {
 
 			console.log('response '+response.statusCode + ' | '+stamp);
 
 			if(response.statusCode != 200){
-				runQuery(moment(targetMoment).subtract(6, 'hours'));
+				setTimeout(function(){ runQuery(moment(targetMoment).subtract(6, 'hours')); }, REQUEST_DELAY_MS);
 			}
 
 			else {
-				// don't rewrite stamps
+			
 				if(!checkPath('json-data/'+ stamp +'.json', false)) {
 
 					console.log('piping ' + stamp);
 
-					// mk sure we've got somewhere to put output
+				
 					checkPath('grib-data', true);
 
-					// pipe the file, resolve the valid time stamp
+					
 					var file = fs.createWriteStream("grib-data/"+stamp+".f000");
 					response.pipe(file);
 					file.on('finish', function() {
@@ -215,7 +227,7 @@ function getGribData(targetMoment){
 
 function convertGribToJson(stamp, targetMoment){
 
-	// mk sure we've got somewhere to put output
+
 	checkPath('json-data', true);
 
 	var exec = require('child_process').exec, child;
@@ -226,40 +238,39 @@ function convertGribToJson(stamp, targetMoment){
 
 			if(error){
 				console.log('exec error: ' + error);
+				isHarvesting = false;
 			}
 
 			else {
 				console.log("converted..");
 
-				// don't keep raw grib data
+				
 				exec('rm grib-data/*');
 
-				// if we don't have older stamp, try and harvest one
+				
 				var prevMoment = moment(targetMoment).subtract(6, 'hours');
 				var prevStamp = prevMoment.format('YYYYMMDD') + roundHours(prevMoment.hour(), 6);
+				var withinHistoryWindow = moment.utc().diff(prevMoment, 'hours') <= HISTORY_HOURS;
 
-				if(!checkPath('json-data/'+ prevStamp +'.json', false)){
+				if(withinHistoryWindow && !checkPath('json-data/'+ prevStamp +'.json', false)){
 
 					console.log("attempting to harvest older data "+ stamp);
-					run(prevMoment);
+					
+					isHarvesting = false;
+					setTimeout(function(){ run(prevMoment); }, REQUEST_DELAY_MS);
 				}
 
 				else {
-					console.log('got older, no need to harvest further');
+					console.log('got enough recent history, no need to harvest further');
+					isHarvesting = false;
 				}
+
+				cleanupOldFiles();
 			}
 		});
 }
 
-/**
- *
- * Round hours to expected interval, e.g. we're currently using 6 hourly interval
- * i.e. 00 || 06 || 12 || 18
- *
- * @param hours
- * @param interval
- * @returns {String}
- */
+
 function roundHours(hours, interval){
 	if(interval > 0){
 		var result = (Math.floor(hours / interval) * interval);
@@ -267,13 +278,7 @@ function roundHours(hours, interval){
 	}
 }
 
-/**
- * Sync check if path or file exists
- *
- * @param path {string}
- * @param mkdir {boolean} create dir if doesn't exist
- * @returns {boolean}
- */
+
 function checkPath(path, mkdir) {
     try {
 	    fs.statSync(path);
@@ -287,5 +292,7 @@ function checkPath(path, mkdir) {
     }
 }
 
-// init harvest
-run(moment.utc());
+
+run(moment.utc().subtract(GFS_PUBLISH_DELAY_HOURS, 'hours'));
+
+setInterval(cleanupOldFiles, 3600000);
